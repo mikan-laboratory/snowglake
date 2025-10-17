@@ -1,12 +1,12 @@
 //// A module for generating unique IDs using the Twitter Snowflake algorithm.
 
-import gleam/erlang
 import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/otp/actor
 import gleam/result
 import gleam/string
+import gleam/time/timestamp
 
 /// The default epoch for the generator. Corresponds to the Twitter epoch.
 pub const default_epoch: Int = 1_288_834_974_657
@@ -20,15 +20,15 @@ const max_index: Int = 4096
 ///
 /// # Examples
 /// ```gleam
-/// import gleam/snowgleam
+/// import gleam/snowglake
 ///
 /// pub type Context {
-///   Context(generator: snowgleam.Generator)
+///   Context(generator: snowglake.Generator)
 /// }
 ///
-/// let assert Ok(generator) = snowgleam.new_generator() |> snowgleam.start()
+/// let assert Ok(generator) = snowglake.new_generator() |> snowglake.start()
 /// let context = Context(generator: generator)
-/// let id = context.generator |> snowgleam.generate()
+/// let id = context.generator |> snowglake.generate()
 /// ```
 pub opaque type Generator {
   Generator(subject: process.Subject(Message))
@@ -77,7 +77,7 @@ pub fn with_timestamp(node: Node, last_ts: Int) -> Node {
 
 /// Starts the generator.
 pub fn start(node: Node) -> Result(Generator, String) {
-  case node.epoch > erlang.system_time(erlang.Millisecond) {
+  case node.epoch > get_now_milliseconds() {
     True -> Error("epoch must be in the past")
     False -> {
       let node = case node.last_ts {
@@ -86,36 +86,47 @@ pub fn start(node: Node) -> Result(Generator, String) {
       }
 
       node
-      |> actor.start(handle_message)
-      |> result.map_error(fn(e) {
-        "could not start actor: " <> e |> string.inspect()
-      })
-      |> result.map(Generator)
+      |> actor.new
+      |> actor.on_message(handle_message)
+      |> actor.start
+      |> result.map_error(format_start_error)
+      |> result.map(fn(started) { Generator(subject: started.data) })
     }
   }
+}
+
+fn format_start_error(error: actor.StartError) -> String {
+  let detail = case error {
+    actor.InitTimeout -> "initialisation timed out"
+    actor.InitFailed(reason) -> "initialisation failed: " <> reason
+    actor.InitExited(reason) ->
+      "initialisation exited: " <> string.inspect(reason)
+  }
+
+  "could not start actor: " <> detail
 }
 
 /// Generates a new Snowflake ID.
 ///
 /// # Examples
 /// ```gleam
-/// import gleam/snowgleam
+/// import gleam/snowglake
 ///
 /// let epoch = 1_420_070_400_000
 /// let worker_id = 12
 /// let process_id = 1
 ///
 /// let assert Ok(generator) =
-///   snowgleam.new_generator()
-///   |> snowgleam.with_epoch(epoch)
-///   |> snowgleam.with_worker_id(worker_id)
-///   |> snowgleam.with_process_id(process_id)
-///   |> snowgleam.start()
+///   snowglake.new_generator()
+///   |> snowglake.with_epoch(epoch)
+///   |> snowglake.with_worker_id(worker_id)
+///   |> snowglake.with_process_id(process_id)
+///   |> snowglake.start()
 ///
-/// let id = snowgleam.generate(generator)
+/// let id = snowglake.generate(generator)
 /// ```
 pub fn generate(generator: Generator) -> Int {
-  actor.call(generator.subject, Generate, 10)
+  actor.call(generator.subject, 10, Generate)
 }
 
 /// Generates a new Snowflake ID lazily.
@@ -125,33 +136,35 @@ pub fn generate(generator: Generator) -> Int {
 /// For example, to generate a batch of IDs or to generate IDs for a particular
 /// time.
 pub fn generate_lazy(generator: Generator) -> Int {
-  actor.call(generator.subject, GenerateLazy, 10)
+  actor.call(generator.subject, 10, GenerateLazy)
 }
 
 /// Generates many Snowflake IDs.
 ///
 /// # Examples
 /// ```gleam
-/// import gleam/snowgleam
+/// import gleam/snowglake
 ///
-/// let assert Ok(generator) = snowgleam.new_generator() |> snowgleam.start()
-/// let ids = snowgleam.generate_many(generator, 5000)
+/// let assert Ok(generator) = snowglake.new_generator() |> snowglake.start()
+/// let ids = snowglake.generate_many(generator, 5000)
 /// ```
 pub fn generate_many(generator: Generator, count: Int) -> List(Int) {
-  actor.call(generator.subject, GenerateMany(count, _), 100)
+  actor.call(generator.subject, 100, fn(reply) { GenerateMany(count, reply) })
 }
 
 /// Generates many Snowflake IDs lazily.
-/// 
+///
 /// # Examples
 /// ```gleam
-/// import gleam/snowgleam
+/// import gleam/snowglake
 ///
-/// let assert Ok(generator) = snowgleam.new_generator() |> snowgleam.start()
-/// let ids = snowgleam.generate_many_lazy(generator, 5000)
+/// let assert Ok(generator) = snowglake.new_generator() |> snowglake.start()
+/// let ids = snowglake.generate_many_lazy(generator, 5000)
 /// ```
 pub fn generate_many_lazy(generator: Generator, count: Int) -> List(Int) {
-  actor.call(generator.subject, GenerateManyLazy(count, _), 100)
+  actor.call(generator.subject, 100, fn(reply) {
+    GenerateManyLazy(count, reply)
+  })
 }
 
 /// Stops the generator.
@@ -160,7 +173,7 @@ pub fn stop(generator: Generator) {
 }
 
 /// Actor message handler.
-fn handle_message(message: Message, node: Node) -> actor.Next(Message, Node) {
+fn handle_message(node: Node, message: Message) -> actor.Next(Node, Message) {
   case message {
     Generate(reply) -> {
       let node = node |> setup
@@ -185,7 +198,7 @@ fn handle_message(message: Message, node: Node) -> actor.Next(Message, Node) {
       actor.send(reply, ids |> list.reverse())
       actor.continue(node)
     }
-    Shutdown -> actor.Stop(process.Normal)
+    Shutdown -> actor.stop()
   }
 }
 
@@ -211,7 +224,7 @@ fn generate_ids(node: Node, count: Int) -> #(Node, List(Int)) {
 }
 
 /// Sets up the node before generating a new ID.
-/// Handles the case where multiple IDs are generated in the same millisecond.  
+/// Handles the case where multiple IDs are generated in the same millisecond.
 /// It wait for the next millisecond if the 4096 were already generated.
 fn setup(node: Node) -> Node {
   let timestamp = node |> get_timestamp
@@ -254,5 +267,20 @@ pub fn process_id(id: Int) -> Int {
 
 /// Gets the current timestamp using erlang os:system_time/1.
 fn get_timestamp(node: Node) -> Int {
-  erlang.system_time(erlang.Millisecond) |> int.subtract(node.epoch)
+  get_now_milliseconds() |> int.subtract(node.epoch)
+}
+
+pub fn get_now_milliseconds() -> Int {
+  let now = timestamp.system_time()
+  let #(seconds, nanoseconds) = timestamp.to_unix_seconds_and_nanoseconds(now)
+
+  let milliseconds_from_nanoseconds = case int.divide(nanoseconds, 1_000_000) {
+    Ok(value) -> value
+    Error(_) ->
+      panic as "unexpected divide-by-zero while computing milliseconds"
+  }
+
+  let ts_ms_int = seconds * 1000 + milliseconds_from_nanoseconds
+
+  ts_ms_int
 }
